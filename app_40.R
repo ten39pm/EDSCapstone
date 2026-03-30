@@ -1,11 +1,24 @@
-library(shiny)
-library(bslib)
-library(terra)
-library(raster)
-library(plotly)
-library(dplyr)
-library(lubridate)
-library(sf)
+# ═══════════════════════════════════════════════════════════════════════════════
+# app.R — HBEF Watershed 3 TOPMODEL Explorer
+#
+# A Shiny app for running TOPMODEL, a rainfall-runoff model that predicts
+# streamflow based on watershed topography, soil properties, and climate inputs.
+# Built for the Hubbard Brook Experimental Forest (HBEF) Watershed 3.
+#
+# Samuel Handel, Kaelyn Harvey, Max Hughes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Core libraries ─────────────────────────────────────────────────────────────
+library(shiny)     # web app framework
+library(bslib)     # bootstrap-based UI themes
+library(terra)     # raster/vector spatial data
+library(raster)    # package for contour plotting
+library(plotly)    # interactive plots
+library(dplyr)     # data wrangling
+library(lubridate) # data handling
+library(sf)        # vector/shapefile data (watershed boundary)
+
+# WBT is only needed to compute TWI
 if (requireNamespace("whitebox", quietly = TRUE)) {
   library(whitebox)
   wbt_init()
@@ -18,19 +31,22 @@ if (requireNamespace("whitebox", quietly = TRUE)) {
 # 0.  FILE PATHS
 # ═══════════════════════════════════════════════════════════════════════════════
 DATA_DIR <- "data"
-PRECIP_F <- file.path(DATA_DIR, "DailyWatershed.csv")
-FLOW_F   <- file.path(DATA_DIR, "HBEF_DailyStreamflow_1956-2024.csv")
-TEMP_F   <- file.path(DATA_DIR, "HBEF_air_temp_daily.csv")
-DEM_F    <- file.path(DATA_DIR, "dem_10m.tif")
-SHP_F    <- file.path(DATA_DIR, "Watershed3HB.shp")
+PRECIP_F <- file.path(DATA_DIR, "DailyWatershed.csv")                 # daily precipitation
+FLOW_F   <- file.path(DATA_DIR, "HBEF_DailyStreamflow_1956-2024.csv") # observed streamflow
+TEMP_F   <- file.path(DATA_DIR, "HBEF_air_temp_daily.csv")            # air temperature
+DEM_F    <- file.path(DATA_DIR, "dem_10m.tif")                        # DEM
+SHP_F    <- file.path(DATA_DIR, "Watershed3HB.shp")                   # watershed boundary polygon
 
+# Temporary folder for WBT files
 TEMP_DIR <- file.path(tempdir(), "topmodel_wb")
 dir.create(TEMP_DIR, showWarnings = FALSE, recursive = TRUE)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1.  LOAD & MERGE DAILY DATA
+# Reads in precipitation, streamflow, and temperature data.
 # ═══════════════════════════════════════════════════════════════════════════════
 load_daily_data <- function() {
+  # Read & filter each dataset to Watershed 3
   precip <- read.csv(PRECIP_F, stringsAsFactors = FALSE)
   precip$DATE <- as.Date(trimws(precip$DATE))
   precip <- precip[trimws(precip$watershed) == "W3", c("DATE", "Precip")]
@@ -41,16 +57,19 @@ load_daily_data <- function() {
   flow <- flow[flow$WS == 3, c("DATE", "Streamflow")]
   names(flow) <- c("date", "flow_mm")
 
+  # Average min/max temperatures to get the daily mean
   temp <- read.csv(TEMP_F, stringsAsFactors = FALSE)
   temp$date <- as.Date(trimws(temp$date))
   temp_avg <- temp %>%
     group_by(date) %>%
     summarise(tavg = mean(AVE, na.rm = TRUE), .groups = "drop")
 
+  # Inner join precip & flow and left join by temp_avg
   df <- merge(precip, flow, by = "date", all = FALSE)
   df <- merge(df, temp_avg, by = "date", all.x = TRUE)
   df <- df[order(df$date), ]
 
+  # Fill missing temperature values by linear interpolation b/w valid points
   if (any(is.na(df$tavg))) {
     idx <- which(!is.na(df$tavg))
     df$tavg <- approx(idx, df$tavg[idx], seq_len(nrow(df)), rule = 2)$y
@@ -60,82 +79,15 @@ load_daily_data <- function() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2.  COMPUTE TWI via WhiteBox Tools
-#
-#     Pipeline:
-#       1. Clip DEM to watershed boundary
-#       2. Breach depressions (least-cost)
-#       3. FD8 specific catchment area (WhiteBox — multi-directional flow)
-#       4. Slope in degrees (WhiteBox)
-#       5. TWI = ln(SCA / tan(slope))
-# ═══════════════════════════════════════════════════════════════════════════════
-compute_twi_raster <- function() {
-  dem <- rast(DEM_F)
-  ws  <- st_read(SHP_F, quiet = TRUE)
-  ws_v <- vect(st_transform(ws, crs(dem)))
-  dem_ws <- mask(crop(dem, ws_v), ws_v)
-
-  dem_clip_f <- file.path(TEMP_DIR, "dem_clip.tif")
-  breached_f <- file.path(TEMP_DIR, "dem_breached.tif")
-  sca_f      <- file.path(TEMP_DIR, "sca.tif")
-  slope_f    <- file.path(TEMP_DIR, "slope.tif")
-  twi_f      <- file.path(TEMP_DIR, "twi.tif")
-
-  writeRaster(dem_ws, dem_clip_f, overwrite = TRUE)
-
-  # Breach depressions to ensure drainage connectivity
-  wbt_breach_depressions_least_cost(
-    dem    = dem_clip_f,
-    output = breached_f,
-    dist   = 10,
-    fill   = TRUE
-  )
-
-  # FD8 specific catchment area (distributes flow to all downslope neighbors)
-  wbt_fd8_flow_accumulation(
-    dem      = breached_f,
-    output   = sca_f,
-    out_type = "specific contributing area"
-  )
-
-  # Slope in degrees via WhiteBox
-  wbt_slope(
-    dem    = breached_f,
-    output = slope_f,
-    units  = "degrees"
-  )
-
-  # Compute TWI = ln(SCA / tan(slope))
-  sca <- rast(sca_f)
-  slp <- rast(slope_f)
-
-  # Convert slope to radians, clamp to avoid division by zero
-  slp_rad <- slp * pi / 180
-  tan_b   <- tan(slp_rad)
-  tan_b[tan_b < 0.001] <- 0.001
-
-  twi <- log(sca / tan_b)
-  mask(twi, dem_ws)
-}
-
-make_topidx_classes <- function(twi_raster, n_classes = 16) {
-  vals <- values(twi_raster, na.rm = TRUE)[, 1]
-  brks <- seq(min(vals), max(vals), length.out = n_classes + 1)
-  mids <- (brks[-1] + brks[-length(brks)]) / 2
-  cnts <- hist(vals, breaks = brks, plot = FALSE)$counts
-  frac <- cnts / sum(cnts)
-  cbind(twi = mids, frac = frac)
-}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3.  HAMON PET (mm/day)
+# 2.  HAMON PET (mm/day)
+# Estimates potential evapotranspiration (PET) from temperature & day length.
 # ═══════════════════════════════════════════════════════════════════════════════
 hamon_pet <- function(tavg, doy, lat_deg = 43.95) {
   lat_rad  <- lat_deg * pi / 180
-  dec      <- 0.4093 * sin(2 * pi * (284 + doy) / 365)
-  ws       <- acos(pmax(pmin(-tan(lat_rad) * tan(dec), 1), -1))
-  daylight <- 24 * ws / pi
-  esat     <- 0.611 * exp(17.27 * tavg / (tavg + 237.3))
+  dec      <- 0.4093 * sin(2 * pi * (284 + doy) / 365)          # solar declination
+  ws       <- acos(pmax(pmin(-tan(lat_rad) * tan(dec), 1), -1)) # sunset hour angle
+  daylight <- 24 * ws / pi                                      # day length (hours)
+  esat     <- 0.611 * exp(17.27 * tavg / (tavg + 237.3)).       # saturation vapor pressure (kPa)
   pet      <- ifelse(tavg > 0,
                      0.1651 * daylight * esat / (tavg + 273.3) * 29.8, 0)
   pmax(pet, 0)
