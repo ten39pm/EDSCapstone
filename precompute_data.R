@@ -17,7 +17,7 @@ library(whitebox)   # package for geospatial data analysis
 wbt_init()
 
 # File paths
-DATA_DIR <- "data"
+DATA_DIR <- "Data"
 PRECIP_F <- file.path(DATA_DIR, "DailyWatershed.csv")
 FLOW_F   <- file.path(DATA_DIR, "HBEF_DailyStreamflow_1956-2024.csv")
 TEMP_F   <- file.path(DATA_DIR, "HBEF_air_temp_daily.csv")
